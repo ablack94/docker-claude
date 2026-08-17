@@ -1,12 +1,16 @@
 name: Build and Publish Docker Image to GHCR
 
 on:
-  # Publish on pushes to main (builds "stable" by default from Dockerfile ARG)
+  # Publish on pushes to main (resolves "stable" to a concrete semver)
   push:
     branches:
       - main
     tags:
       - "v*"
+
+  # Daily rebuild: publish a new image whenever Claude ships a new stable release
+  schedule:
+    - cron: "17 4 * * *"
 
   # Allow manual dispatch to build specific Claude versions
   workflow_dispatch:
@@ -26,6 +30,8 @@ env:
   REGISTRY: ghcr.io
   # ghcr.io/ablack94/docker-claude
   IMAGE_NAME: ${{ github.repository }}
+  # Release metadata bucket used by https://claude.ai/install.sh
+  RELEASES_URL: https://downloads.claude.ai/claude-code-releases
 
 jobs:
   build-and-push:
@@ -46,6 +52,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Login happens early: the scheduled run needs it to inspect existing tags
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -53,40 +60,98 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # --- Version resolution ---
+      # Never build with the literal "stable"/"latest" moving targets: resolve
+      # them to a concrete semver first so every build is pinned/reproducible.
+      # The endpoint is the same one install.sh reads ($RELEASES_URL/<channel>).
+      - name: Resolve Claude version
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              REQUESTED="${{ inputs.claude_version }}"
+              ;;
+            *)
+              if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+                # For git tags like v1.2.3, strip the 'v' prefix
+                TAG="${{ github.ref_name }}"
+                REQUESTED="${TAG#v}"
+              else
+                # push to main, or scheduled run
+                REQUESTED="stable"
+              fi
+              ;;
+          esac
+
+          if [[ "$REQUESTED" == "stable" || "$REQUESTED" == "latest" ]]; then
+            VERSION="$(curl -fsSL "${RELEASES_URL}/${REQUESTED}" | tr -d '[:space:]')"
+            echo "Resolved channel '$REQUESTED' to '$VERSION'"
+          else
+            VERSION="$REQUESTED"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Resolved Claude version '$VERSION' is not a valid semver" >&2
+            exit 1
+          fi
+
+          # Strip any pre-release/build suffix for the X.Y / X rollup tags
+          CORE="$(echo "$VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+
+          {
+            echo "version=$VERSION"
+            echo "major=${CORE%%.*}"
+            echo "minor=$(echo "$CORE" | cut -d. -f1-2)"
+          } >> "$GITHUB_OUTPUT"
+
+      # --- Scheduled run: skip if this version is already published ---
+      - name: Check if version is already published
+        id: check_existing
+        if: github.event_name == 'schedule'
+        run: |
+          set -uo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ steps.resolve.outputs.version }}"
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "$IMAGE already exists - nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$IMAGE not found - building."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # --- Tag logic ---
-      # For push events: generate tags from git ref (branch name, git tag)
-      # For workflow_dispatch: use the manually specified image_tag
+      # Runs after "resolve" so the tag expressions can use its outputs.
+      #   push to main / schedule -> stable + X.Y.Z + X.Y + X (from resolved version)
+      #   git tag vX.Y.Z          -> X.Y.Z + X.Y + X (from the git tag)
+      #   workflow_dispatch       -> the manually specified image_tag
       - name: Extract metadata (tags, labels) for Docker
         id: meta
+        if: steps.check_existing.outputs.skip != 'true'
         uses: docker/metadata-action@v5
+        env:
+          IS_RELEASE_LINE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' }}
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # On push to main, tag as "stable"
-            type=raw,value=stable,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            # Rolling "stable" pointer, plus semver tags for the resolved version
+            type=raw,value=stable,enable=${{ env.IS_RELEASE_LINE }}
+            type=raw,value=${{ steps.resolve.outputs.version }},enable=${{ env.IS_RELEASE_LINE }}
+            type=raw,value=${{ steps.resolve.outputs.minor }},enable=${{ env.IS_RELEASE_LINE }}
+            type=raw,value=${{ steps.resolve.outputs.major }},enable=${{ env.IS_RELEASE_LINE }}
             # On git tag push (v1.2.3), produce semver tags: 1.2.3, 1.2, 1
             type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
             # On workflow_dispatch, use the manually provided tag
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
-      # Determine which CLAUDE_VERSION build arg to use
-      - name: Determine Claude version
-        id: claude_version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.claude_version }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            # For git tags like v1.2.3, strip the 'v' prefix and use as claude version
-            TAG="${{ github.ref_name }}"
-            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=stable" >> "$GITHUB_OUTPUT"
-          fi
+          labels: |
+            org.opencontainers.image.version=${{ steps.resolve.outputs.version }}
 
       - name: Build and push Docker image
         id: push
+        if: steps.check_existing.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -94,12 +159,13 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            CLAUDE_VERSION=${{ steps.claude_version.outputs.version }}
+            CLAUDE_VERSION=${{ steps.resolve.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # Generate artifact attestation for supply chain security
       - name: Generate artifact attestation
+        if: steps.check_existing.outputs.skip != 'true'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
