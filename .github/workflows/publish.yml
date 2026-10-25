@@ -1,16 +1,20 @@
 name: Build and Publish Docker Image to GHCR
 
 on:
-  # Publish on pushes to main (resolves "stable" to a concrete semver)
+  # Rebuild both channels whenever the image definition changes
   push:
     branches:
       - main
+    paths-ignore:
+      - "**.md"
     tags:
       - "v*"
 
-  # Daily rebuild: publish a new image whenever Claude ships a new stable release
+  # Poll for new Claude releases. GitHub can't trigger on pushes to another
+  # repo (anthropics/claude-code), so we poll the same release endpoints
+  # install.sh uses. A no-op poll takes a few seconds.
   schedule:
-    - cron: "17 4 * * *"
+    - cron: "7,37 * * * *"
 
   # Allow manual dispatch to build specific Claude versions
   workflow_dispatch:
@@ -26,6 +30,12 @@ on:
         default: "stable"
         type: string
 
+# Never run two publishes at once: they would race on the rolling tags and on
+# the README commit.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   # ghcr.io/ablack94/docker-claude
@@ -34,7 +44,43 @@ env:
   RELEASES_URL: https://downloads.claude.ai/claude-code-releases
 
 jobs:
-  build-and-push:
+  # Resolve stable/latest to concrete semvers and work out, per version,
+  # whether it needs a build, a retag, or nothing. See .github/scripts/plan.sh.
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      channels: ${{ steps.plan.outputs.channels }}
+      stable: ${{ steps.plan.outputs.stable }}
+      latest: ${{ steps.plan.outputs.latest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Plan builds
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.claude_version }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: .github/scripts/plan.sh
+
+  publish:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
 
     # Required for pushing packages and for OIDC token (attestations)
@@ -44,15 +90,22 @@ jobs:
       attestations: write
       id-token: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    name: ${{ matrix.action }} ${{ matrix.version }}
+
     steps:
       - name: Checkout repository
+        if: matrix.action == 'build'
         uses: actions/checkout@v4
 
-      # Buildx is required for advanced build features (caching, multi-platform, etc.)
+      # Buildx is required for advanced build features (caching, imagetools, etc.)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Login happens early: the scheduled run needs it to inspect existing tags
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -60,114 +113,92 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- Version resolution ---
-      # Never build with the literal "stable"/"latest" moving targets: resolve
-      # them to a concrete semver first so every build is pinned/reproducible.
-      # The endpoint is the same one install.sh reads ($RELEASES_URL/<channel>).
-      - name: Resolve Claude version
-        id: resolve
+      # --- Retag: the version is already published, point the channel/rolling
+      # tags at it. A carbon copy keeps the digest, so existing attestations
+      # still apply.
+      - name: Retag existing image
+        if: matrix.action == 'retag'
+        env:
+          SOURCE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}
+          TAGS: ${{ matrix.tags }}
         run: |
           set -euo pipefail
+          args=()
+          IFS=',' read -ra refs <<<"$TAGS"
+          for ref in "${refs[@]}"; do args+=(--tag "$ref"); done
+          docker buildx imagetools create --prefer-index=false "${args[@]}" "$SOURCE"
 
-          case "${{ github.event_name }}" in
-            workflow_dispatch)
-              REQUESTED="${{ inputs.claude_version }}"
-              ;;
-            *)
-              if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-                # For git tags like v1.2.3, strip the 'v' prefix
-                TAG="${{ github.ref_name }}"
-                REQUESTED="${TAG#v}"
-              else
-                # push to main, or scheduled run
-                REQUESTED="stable"
-              fi
-              ;;
-          esac
-
-          if [[ "$REQUESTED" == "stable" || "$REQUESTED" == "latest" ]]; then
-            VERSION="$(curl -fsSL "${RELEASES_URL}/${REQUESTED}" | tr -d '[:space:]')"
-            echo "Resolved channel '$REQUESTED' to '$VERSION'"
-          else
-            VERSION="$REQUESTED"
-          fi
-
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "::error::Resolved Claude version '$VERSION' is not a valid semver" >&2
-            exit 1
-          fi
-
-          # Strip any pre-release/build suffix for the X.Y / X rollup tags
-          CORE="$(echo "$VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
-
-          {
-            echo "version=$VERSION"
-            echo "major=${CORE%%.*}"
-            echo "minor=$(echo "$CORE" | cut -d. -f1-2)"
-          } >> "$GITHUB_OUTPUT"
-
-      # --- Scheduled run: skip if this version is already published ---
-      - name: Check if version is already published
-        id: check_existing
-        if: github.event_name == 'schedule'
-        run: |
-          set -uo pipefail
-          IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ steps.resolve.outputs.version }}"
-          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
-            echo "$IMAGE already exists - nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "$IMAGE not found - building."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # --- Tag logic ---
-      # Runs after "resolve" so the tag expressions can use its outputs.
-      #   push to main / schedule -> stable + X.Y.Z + X.Y + X (from resolved version)
-      #   git tag vX.Y.Z          -> X.Y.Z + X.Y + X (from the git tag)
-      #   workflow_dispatch       -> the manually specified image_tag
-      - name: Extract metadata (tags, labels) for Docker
+      # --- Build: standard OCI labels from metadata-action, plus the version.
+      # Tags come from the plan, so metadata-action's tag output is unused.
+      - name: Extract metadata (labels) for Docker
         id: meta
-        if: steps.check_existing.outputs.skip != 'true'
+        if: matrix.action == 'build'
         uses: docker/metadata-action@v5
-        env:
-          IS_RELEASE_LINE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' }}
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            # Rolling "stable" pointer, plus semver tags for the resolved version
-            type=raw,value=stable,enable=${{ env.IS_RELEASE_LINE }}
-            type=raw,value=${{ steps.resolve.outputs.version }},enable=${{ env.IS_RELEASE_LINE }}
-            type=raw,value=${{ steps.resolve.outputs.minor }},enable=${{ env.IS_RELEASE_LINE }}
-            type=raw,value=${{ steps.resolve.outputs.major }},enable=${{ env.IS_RELEASE_LINE }}
-            # On git tag push (v1.2.3), produce semver tags: 1.2.3, 1.2, 1
-            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-            # On workflow_dispatch, use the manually provided tag
-            type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
           labels: |
-            org.opencontainers.image.version=${{ steps.resolve.outputs.version }}
+            org.opencontainers.image.version=${{ matrix.version }}
 
       - name: Build and push Docker image
         id: push
-        if: steps.check_existing.outputs.skip != 'true'
+        if: matrix.action == 'build'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ matrix.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            CLAUDE_VERSION=${{ steps.resolve.outputs.version }}
+            CLAUDE_VERSION=${{ matrix.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # Generate artifact attestation for supply chain security
       - name: Generate artifact attestation
-        if: steps.check_existing.outputs.skip != 'true'
+        if: matrix.action == 'build'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  # Record the current stable/latest versions in README.md. Runs even when
+  # publish had nothing to do, so the README converges if it ever drifts.
+  # Commits made with GITHUB_TOKEN don't trigger workflows, so this can't loop.
+  update-readme:
+    needs: [plan, publish]
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      needs.plan.outputs.channels == 'true' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update README
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: .github/scripts/update-readme.sh "${{ needs.plan.outputs.stable }}" "${{ needs.plan.outputs.latest }}"
+
+      - name: Commit and push if changed
+        env:
+          STABLE: ${{ needs.plan.outputs.stable }}
+          LATEST: ${{ needs.plan.outputs.latest }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md; then
+            echo "README already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: update README versions (stable ${STABLE}, latest ${LATEST})" -- README.md
+          # main may have moved since checkout; rebase onto it before pushing.
+          git pull --rebase origin main
+          git push origin HEAD:main
