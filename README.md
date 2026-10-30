@@ -39,7 +39,7 @@ docker run --rm -it ghcr.io/ablack94/docker-claude:stable --help
 | Tag | Claude Code version | Pull |
 |-----|---------------------|------|
 | `stable` | [`2.1.308`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:stable` |
-| `latest` | [`2.1.312`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:latest` |
+| `latest` | [`2.1.314`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:latest` |
 <!-- versions:end -->
 
 ## Available Tags
