@@ -38,8 +38,8 @@ docker run --rm -it ghcr.io/ablack94/docker-claude:stable --help
 <!-- This block is updated automatically by .github/workflows/publish.yml. Do not edit it by hand. -->
 | Tag | Claude Code version | Pull |
 |-----|---------------------|------|
-| `stable` | [`2.1.308`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:stable` |
-| `latest` | [`2.1.314`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:latest` |
+| `stable` | [`2.1.309`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:stable` |
+| `latest` | [`2.1.316`](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | `docker pull ghcr.io/ablack94/docker-claude:latest` |
 <!-- versions:end -->
 
 ## Available Tags
